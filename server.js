@@ -7,6 +7,13 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Tự động nạp file .env ở local (Node 20+ built-in, không cần thư viện dotenv)
+try {
+  process.loadEnvFile();
+} catch (e) {
+  // Bỏ qua nếu chạy trên cloud (Render sẽ truyền qua Dashboard Environment Variables)
+}
+
 // 1. Kiểm tra bắt buộc biến môi trường PORT và GATEWAY_SECRET (Không dùng fallback)
 const portEnv = process.env.PORT;
 if (!portEnv) {

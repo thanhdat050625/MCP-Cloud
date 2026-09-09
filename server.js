@@ -4,17 +4,37 @@ import { spawn } from 'child_process';
 import crypto from 'crypto';
 
 const app = express();
-app.use(cors());
+
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'x-gateway-key',
+    'x-gateway-secret',
+    'x-postgres-url',
+    'x-rmq-host',
+    'x-rmq-port',
+    'x-rmq-user',
+    'x-rmq-pass',
+    'x-rmq-proto',
+    'mcp-session-id',
+    'x-mcp-session-id'
+  ],
+  exposedHeaders: ['Mcp-Session-Id', 'Content-Type']
+}));
+
 app.use(express.json());
 
 // Tự động nạp file .env ở local (Node 20+ built-in, không cần thư viện dotenv)
 try {
   process.loadEnvFile();
 } catch (e) {
-  // Bỏ qua nếu chạy trên cloud (Render sẽ truyền qua Dashboard Environment Variables)
+  // Bỏ qua nếu chạy trên cloud (Render truyền qua Dashboard Environment Variables)
 }
 
-// 1. Kiểm tra bắt buộc biến môi trường PORT và GATEWAY_SECRET (Không dùng fallback)
+// 1. Kiểm tra bắt buộc biến môi trường PORT và GATEWAY_SECRET (Tuyệt đối không dùng fallback)
 const portEnv = process.env.PORT;
 if (!portEnv) {
   console.error("FATAL: Missing required environment variable PORT");
@@ -45,7 +65,23 @@ function isEnabled(toolName) {
 // 2. Quản lý active sessions
 const activeSessions = new Map();
 
-// 3. Endpoint health check (Dùng cho UptimeRobot ping mỗi 5 phút chống sleep)
+// Dọn dẹp session quá hạn không hoạt động sau 15 phút
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of activeSessions.entries()) {
+    if (!session.sseRes && (now - session.lastActivity > 15 * 60 * 1000)) {
+      console.log(`[Gateway] Session ${id} expired due to inactivity. Terminating.`);
+      try {
+        session.child.kill();
+      } catch (e) {
+        // Bỏ qua lỗi tiến trình đã đóng
+      }
+      activeSessions.delete(id);
+    }
+  }
+}, 60000);
+
+// 3. Endpoint health check (UptimeRobot ping chống sleep)
 app.get('/health', (req, res) => {
   res.status(200).json({
     status: "OK",
@@ -55,106 +91,340 @@ app.get('/health', (req, res) => {
   });
 });
 
-// 4. Middleware xác thực Gateway Key (Bắt buộc chính xác, không dùng fallback)
+// 4. Middleware xác thực Gateway Key (Không dùng fallback)
 app.use((req, res, next) => {
   if (req.path === '/health') {
     return next();
   }
-  const key = req.headers['x-gateway-key'];
+
+  let key = null;
+  if (req.headers['x-gateway-key']) {
+    key = req.headers['x-gateway-key'];
+  } else if (req.headers['x-gateway-secret']) {
+    key = req.headers['x-gateway-secret'];
+  } else if (req.query.gateway_key) {
+    key = req.query.gateway_key;
+  }
+
   if (!key || key !== GATEWAY_SECRET) {
     return res.status(401).json({ error: "Unauthorized: Invalid or missing x-gateway-key" });
   }
   next();
 });
 
-// 5. Cầu nối Stdio -> SSE 2 chiều chuẩn Model Context Protocol
-function registerMcpTool(routePath, commandResolver) {
-  // Chiều 1: Nhận kết nối SSE (Stream dữ liệu từ MCP server con về IDE)
-  app.get(`${routePath}/sse`, (req, res) => {
-    let config;
+// Trích xuất sessionId từ header hoặc query (Không dùng toán tử fallback)
+function getSessionId(req) {
+  if (req.headers['mcp-session-id']) {
+    return req.headers['mcp-session-id'];
+  }
+  if (req.headers['x-mcp-session-id']) {
+    return req.headers['x-mcp-session-id'];
+  }
+  if (req.query.sessionId) {
+    return req.query.sessionId;
+  }
+  return null;
+}
+
+// Khởi tạo child process cho session
+function createMcpChildSession(sessionId, routePath, commandResolver, req, isLegacy) {
+  const config = commandResolver(req);
+
+  const child = spawn(config.command, config.args, {
+    env: { ...process.env, ...config.env }
+  });
+
+  const session = {
+    id: sessionId,
+    child,
+    pendingRequests: new Map(),
+    sseRes: null,
+    lastActivity: Date.now(),
+    stdoutBuffer: '',
+    isLegacy
+  };
+
+  child.stdout.on('data', (chunk) => {
+    session.stdoutBuffer += chunk.toString('utf8');
+    let newlineIdx;
+    while ((newlineIdx = session.stdoutBuffer.indexOf('\n')) !== -1) {
+      const line = session.stdoutBuffer.slice(0, newlineIdx).trim();
+      session.stdoutBuffer = session.stdoutBuffer.slice(newlineIdx + 1);
+      if (!line) {
+        continue;
+      }
+
+      try {
+        const msg = JSON.parse(line);
+        if (!session.isLegacy && msg.id !== undefined && session.pendingRequests.has(msg.id)) {
+          const pending = session.pendingRequests.get(msg.id);
+          session.pendingRequests.delete(msg.id);
+          clearTimeout(pending.timer);
+          pending.resolve(msg);
+        } else if (session.sseRes && !session.sseRes.writableEnded) {
+          session.sseRes.write(`event: message\ndata: ${line}\n\n`);
+        }
+      } catch (e) {
+        console.error(`[${routePath}] Stdout parse error:`, e.message, line);
+      }
+    }
+  });
+
+  child.stderr.on('data', (chunk) => {
+    console.log(`[${routePath}] ${chunk.toString().trim()}`);
+  });
+
+  child.on('error', (err) => {
+    console.error(`[${routePath}] Child error:`, err);
+    for (const pending of session.pendingRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(err);
+    }
+    session.pendingRequests.clear();
+    activeSessions.delete(sessionId);
+  });
+
+  child.on('exit', (code, sig) => {
+    console.log(`[${routePath}] Child exited (code ${code}, sig ${sig})`);
+    for (const pending of session.pendingRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error(`MCP process exited before responding (code ${code})`));
+    }
+    session.pendingRequests.clear();
+    activeSessions.delete(sessionId);
+  });
+
+  activeSessions.set(sessionId, session);
+  return session;
+}
+
+// 5. Cầu nối HTTP POST (Streamable HTTP Transport)
+function handlePost(routePath, commandResolver, req, res) {
+  let sessionId = getSessionId(req);
+  let session = null;
+
+  if (sessionId) {
+    session = activeSessions.get(sessionId);
+    if (!session) {
+      return res.status(404).json({ error: "Session not found or expired" });
+    }
+  }
+
+  const body = req.body;
+  if (!body) {
+    return res.status(400).json({ error: "Missing request body" });
+  }
+
+  // 1. Khởi tạo session mới qua initialize
+  if (body.method === 'initialize') {
+    sessionId = crypto.randomUUID();
     try {
-      config = commandResolver(req);
+      session = createMcpChildSession(sessionId, routePath, commandResolver, req, false);
     } catch (err) {
       return res.status(400).json({ error: err.message });
+    }
+  }
+
+  if (!session) {
+    return res.status(400).json({ error: "Missing Mcp-Session-Id header or initialize request" });
+  }
+
+  session.lastActivity = Date.now();
+
+  // 2. JSON-RPC Notifications (không có trường id)
+  if (body.id === undefined) {
+    try {
+      session.child.stdin.write(JSON.stringify(body) + '\n');
+      res.setHeader('Mcp-Session-Id', sessionId);
+      res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id');
+      return res.status(202).json({ status: "Accepted" });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // 3. JSON-RPC Requests (có trường id)
+  const reqId = body.id;
+  const promise = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      session.pendingRequests.delete(reqId);
+      reject(new Error("Request timeout waiting for child MCP process"));
+    }, 30000);
+    session.pendingRequests.set(reqId, { resolve, reject, timer });
+  });
+
+  try {
+    session.child.stdin.write(JSON.stringify(body) + '\n');
+  } catch (err) {
+    session.pendingRequests.delete(reqId);
+    return res.status(500).json({ error: err.message });
+  }
+
+  promise.then((responseObj) => {
+    res.setHeader('Mcp-Session-Id', sessionId);
+    res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id');
+    return res.status(200).json(responseObj);
+  }).catch((err) => {
+    return res.status(500).json({ error: err.message });
+  });
+}
+
+// 6. Cầu nối HTTP GET (Standalone SSE hoặc Legacy SSE)
+function handleGet(routePath, commandResolver, req, res) {
+  let sessionId = getSessionId(req);
+
+  // Nhánh 1: Standalone SSE cho session đang chạy (Streamable HTTP)
+  if (sessionId) {
+    const session = activeSessions.get(sessionId);
+    if (!session) {
+      return res.status(404).json({ error: "Session not found or expired" });
     }
 
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Mcp-Session-Id', sessionId);
+    res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id');
     if (typeof res.flushHeaders === 'function') {
       res.flushHeaders();
     }
 
-    const sessionId = crypto.randomUUID();
+    session.sseRes = res;
+    session.lastActivity = Date.now();
 
-    // Khởi tạo tiến trình MCP con (gọi trực tiếp node ./node_modules/... siêu nhẹ)
-    const child = spawn(config.command, config.args, {
-      env: { ...process.env, ...config.env }
-    });
-
-    const sessionData = { child, res };
-    activeSessions.set(sessionId, sessionData);
-
-    // Heartbeat mỗi 20s (chống timeout 100s của Render proxy)
     const keepAliveTimer = setInterval(() => {
-      res.write(': keepalive\n\n');
-    }, 20000);
-
-    // Gửi endpoint event chuẩn MCP specification
-    res.write(`event: endpoint\ndata: ${routePath}/messages?sessionId=${sessionId}\n\n`);
-
-    child.stdout.on('data', (chunk) => {
-      const lines = chunk.toString().split('\n').filter(Boolean);
-      for (const line of lines) {
-        res.write(`event: message\ndata: ${line}\n\n`);
+      if (!res.writableEnded) {
+        res.write(': keepalive\n\n');
       }
-    });
-
-    child.stderr.on('data', (chunk) => {
-      // Các server MCP in log thông tin ra stderr để giữ stdout sạch cho JSON-RPC
-      console.log(`[${routePath}] ${chunk.toString().trim()}`);
-    });
+    }, 20000);
 
     req.on('close', () => {
       clearInterval(keepAliveTimer);
-      activeSessions.delete(sessionId);
-      child.kill();
+      if (session.sseRes === res) {
+        session.sseRes = null;
+      }
     });
-  });
+    return;
+  }
 
-  // Chiều 2: Nhận request JSON-RPC POST từ client và ghi vào stdin của tiến trình MCP
-  app.post(`${routePath}/messages`, (req, res) => {
-    const sessionId = req.query.sessionId;
-    if (!sessionId) {
-      return res.status(400).json({ error: "Missing required query parameter: sessionId" });
+  // Nhánh 2: Khởi tạo kết nối Legacy SSE chuẩn MCP 2024
+  let config;
+  try {
+    config = commandResolver(req);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  if (typeof res.flushHeaders === 'function') {
+    res.flushHeaders();
+  }
+
+  sessionId = crypto.randomUUID();
+  let session;
+  try {
+    session = createMcpChildSession(sessionId, routePath, commandResolver, req, true);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+  session.sseRes = res;
+
+  const keepAliveTimer = setInterval(() => {
+    if (!res.writableEnded) {
+      res.write(': keepalive\n\n');
     }
+  }, 20000);
 
-    const session = activeSessions.get(sessionId);
-    if (!session || !session.child) {
-      return res.status(404).json({ error: "Session expired or not found" });
-    }
+  res.write(`event: endpoint\ndata: ${routePath}/messages?sessionId=${sessionId}\n\n`);
 
+  req.on('close', () => {
+    clearInterval(keepAliveTimer);
+    activeSessions.delete(sessionId);
     try {
-      const message = JSON.stringify(req.body) + '\n';
-      session.child.stdin.write(message);
-      res.status(202).send("Accepted");
-    } catch (err) {
-      res.status(500).json({ error: err.message });
+      session.child.kill();
+    } catch (e) {
+      // Bỏ qua lỗi tiến trình đã đóng
     }
   });
 }
 
+// 7. Cầu nối HTTP DELETE (Chấm dứt session)
+function handleDelete(routePath, req, res) {
+  const sessionId = getSessionId(req);
+  if (!sessionId) {
+    return res.status(400).json({ error: "Missing required session ID (Mcp-Session-Id header or query parameter)" });
+  }
+
+  const session = activeSessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: "Session not found" });
+  }
+
+  try {
+    session.child.kill();
+  } catch (e) {
+    // Bỏ qua lỗi tiến trình đã đóng
+  }
+  activeSessions.delete(sessionId);
+  return res.status(200).json({ status: "Session terminated" });
+}
+
+// 8. Cầu nối POST messages cho Legacy SSE
+function handleLegacyMessages(routePath, req, res) {
+  const sessionId = req.query.sessionId;
+  if (!sessionId) {
+    return res.status(400).json({ error: "Missing required query parameter: sessionId" });
+  }
+
+  const session = activeSessions.get(sessionId);
+  if (!session || !session.child) {
+    return res.status(404).json({ error: "Session expired or not found" });
+  }
+
+  try {
+    const message = JSON.stringify(req.body) + '\n';
+    session.child.stdin.write(message);
+    res.status(202).send("Accepted");
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+}
+
+// Đăng ký toàn diện các giao thức (Streamable HTTP + SSE) cho một công cụ MCP
+function registerMcpTool(routePath, commandResolver) {
+  // Hỗ trợ cả /routePath và /routePath/sse
+  const endpoints = [routePath, `${routePath}/sse`];
+
+  for (const ep of endpoints) {
+    app.post(ep, (req, res) => handlePost(routePath, commandResolver, req, res));
+    app.get(ep, (req, res) => handleGet(routePath, commandResolver, req, res));
+    app.delete(ep, (req, res) => handleDelete(routePath, req, res));
+  }
+
+  // Legacy SSE message endpoint
+  app.post(`${routePath}/messages`, (req, res) => handleLegacyMessages(routePath, req, res));
+}
+
 // =========================================================================
-// KHỞI TẠO 3 CÔNG CỤ THEO BIẾN ENABLED_MCPS
+// KHỞI TẠO CÁC CÔNG CỤ THEO BIẾN ENABLED_MCPS
 // =========================================================================
 
-// 1. POSTGRES (Bắt buộc header x-postgres-url, không fallback)
+// 1. POSTGRES (Bắt buộc header x-postgres-url hoặc query db_url, không fallback)
 if (isEnabled('postgres')) {
   registerMcpTool('/mcp/postgres', (req) => {
-    const pgUrl = req.headers['x-postgres-url'];
-    if (!pgUrl) {
-      throw new Error("Missing required header: x-postgres-url");
+    let pgUrl = null;
+    if (req.headers['x-postgres-url']) {
+      pgUrl = req.headers['x-postgres-url'];
+    } else if (req.query.db_url) {
+      pgUrl = req.query.db_url;
     }
+
+    if (!pgUrl) {
+      throw new Error("Missing required PostgreSQL URL (header x-postgres-url or query parameter db_url)");
+    }
+
     return {
       command: 'node',
       args: ['./custom_mcps/postgres/index.js', pgUrl],
@@ -164,17 +434,47 @@ if (isEnabled('postgres')) {
   console.log("[Gateway] Registered tool: /mcp/postgres");
 }
 
-// 2. RABBITMQ (Bắt buộc đủ 5 headers, không fallback)
+// 2. RABBITMQ (Bắt buộc đủ 5 thông số kết nối, không fallback)
 if (isEnabled('rabbitmq')) {
   registerMcpTool('/mcp/rabbitmq', (req) => {
-    const host = req.headers['x-rmq-host'];
-    const port = req.headers['x-rmq-port'];
-    const user = req.headers['x-rmq-user'];
-    const pass = req.headers['x-rmq-pass'];
-    const proto = req.headers['x-rmq-proto'];
+    let host = null;
+    let port = null;
+    let user = null;
+    let pass = null;
+    let proto = null;
+
+    if (req.headers['x-rmq-host']) {
+      host = req.headers['x-rmq-host'];
+    } else if (req.query.host) {
+      host = req.query.host;
+    }
+
+    if (req.headers['x-rmq-port']) {
+      port = req.headers['x-rmq-port'];
+    } else if (req.query.port) {
+      port = req.query.port;
+    }
+
+    if (req.headers['x-rmq-user']) {
+      user = req.headers['x-rmq-user'];
+    } else if (req.query.user) {
+      user = req.query.user;
+    }
+
+    if (req.headers['x-rmq-pass']) {
+      pass = req.headers['x-rmq-pass'];
+    } else if (req.query.pass) {
+      pass = req.query.pass;
+    }
+
+    if (req.headers['x-rmq-proto']) {
+      proto = req.headers['x-rmq-proto'];
+    } else if (req.query.proto) {
+      proto = req.query.proto;
+    }
 
     if (!host || !port || !user || !pass || !proto) {
-      throw new Error("Missing required RabbitMQ headers: x-rmq-host, x-rmq-port, x-rmq-user, x-rmq-pass, x-rmq-proto");
+      throw new Error("Missing required RabbitMQ parameters: host, port, user, pass, proto");
     }
 
     return {
@@ -192,7 +492,7 @@ if (isEnabled('rabbitmq')) {
   console.log("[Gateway] Registered tool: /mcp/rabbitmq");
 }
 
-// 3. PLANTUML (Không cần key bảo mật)
+// 3. PLANTUML
 if (isEnabled('plantuml')) {
   registerMcpTool('/mcp/plantuml', () => {
     return {

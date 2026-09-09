@@ -110,8 +110,9 @@ function registerMcpTool(routePath, commandResolver) {
       }
     });
 
-    child.stderr.on('data', (err) => {
-      console.error(`[${routePath}] Child Error:`, err.toString());
+    child.stderr.on('data', (chunk) => {
+      // Các server MCP in log thông tin ra stderr để giữ stdout sạch cho JSON-RPC
+      console.log(`[${routePath}] ${chunk.toString().trim()}`);
     });
 
     req.on('close', () => {

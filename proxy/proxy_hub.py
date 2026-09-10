@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import shutil
 import ctypes
 import asyncio
 import subprocess
@@ -22,6 +23,7 @@ MAX_RAM_MB = float(os.environ.get("MAX_RAM_MB", "380.0"))
 START_TIME = time.time()
 managed_processes = {}
 http_client: httpx.AsyncClient = None
+headroom_ready = False
 
 # 2. Quản lý tiến trình Headroom
 def start_headroom_sub():
@@ -33,15 +35,16 @@ def start_headroom_sub():
     env["PYTHONUNBUFFERED"] = "1"
     env["MALLOC_TRIM_THRESHOLD_"] = "100000"
 
+    headroom_bin = shutil.which("headroom") or "headroom"
     cmd = [
-        sys.executable, "-m", "headroom.cli.main", "proxy",
+        headroom_bin, "proxy",
         "--host", "127.0.0.1",
         "--port", str(HEADROOM_PORT),
         "--stateless",
         "--no-telemetry",
         "--no-cache"
     ]
-    print(f"[Proxy Hub] Spawning Headroom Proxy on 127.0.0.1:{HEADROOM_PORT}...", flush=True)
+    print(f"[Proxy Hub] Spawning Headroom: {' '.join(cmd)}", flush=True)
     proc = subprocess.Popen(cmd, env=env)
     managed_processes["headroom"] = proc
     return proc
@@ -71,7 +74,6 @@ async def memory_watchdog():
         await asyncio.sleep(60)
         run_malloc_trim()
 
-        # Kiểm tra tổng RAM tiêu thụ
         total_rss = 0.0
         try:
             hub_proc = psutil.Process()
@@ -95,25 +97,29 @@ async def memory_watchdog():
                 start_headroom_sub()
             run_malloc_trim()
 
-# 4. Lifespan quản lý vòng đời ứng dụng
+async def background_headroom_launcher():
+    global headroom_ready
+    start_headroom_sub()
+    for _ in range(30):
+        await asyncio.sleep(0.5)
+        try:
+            r = await http_client.get(f"http://127.0.0.1:{HEADROOM_PORT}/livez", timeout=1.0)
+            if r.status_code == 200:
+                headroom_ready = True
+                print(f"[Proxy Hub] Headroom Proxy is READY and accepting traffic on 127.0.0.1:{HEADROOM_PORT}!", flush=True)
+                break
+        except Exception:
+            pass
+
+# 4. Lifespan quản lý vòng đời ứng dụng (Khởi động tức thì trong 0.05s)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
     http_client = httpx.AsyncClient(timeout=None)
 
-    # Khởi động các proxy được khai báo trong ENABLED_PROXIES
+    # Khởi động Headroom bất đồng bộ trong background để port 10000 bind ngay lập tức
     if "headroom" in ENABLED_PROXIES or "all" in ENABLED_PROXIES:
-        start_headroom_sub()
-        # Chờ tối đa 10s cho Headroom sẵn sàng
-        for _ in range(20):
-            await asyncio.sleep(0.5)
-            try:
-                r = await http_client.get(f"http://127.0.0.1:{HEADROOM_PORT}/livez", timeout=1.0)
-                if r.status_code == 200:
-                    print(f"[Proxy Hub] Headroom Proxy is READY on 127.0.0.1:{HEADROOM_PORT}!", flush=True)
-                    break
-            except Exception:
-                pass
+        asyncio.create_task(background_headroom_launcher())
 
     # Kích hoạt background watchdog
     watchdog_task = asyncio.create_task(memory_watchdog())
@@ -155,6 +161,7 @@ async def health_check():
         "status": "OK",
         "service": "proxy-gateway-hub",
         "enabled_proxies": ENABLED_PROXIES,
+        "headroom_ready": headroom_ready,
         "uptime_seconds": round(time.time() - START_TIME, 1),
         "memory": {
             "hub_rss_mb": round(hub_rss / (1024 * 1024), 2),
@@ -222,7 +229,6 @@ async def proxy_headroom_namespaced(path: str, request: Request):
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def proxy_v1(path: str, request: Request):
-    # Route chuẩn của Claude Code / OpenAI / Gemini khi trỏ trực tiếp Proxy URL vào domain gốc
     if "headroom" in ENABLED_PROXIES or "all" in ENABLED_PROXIES:
         target = f"http://127.0.0.1:{HEADROOM_PORT}/v1/{path}"
         return await forward_request(target, request)
@@ -230,7 +236,6 @@ async def proxy_v1(path: str, request: Request):
 
 @app.api_route("/v1internal:{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def proxy_v1internal(path: str, request: Request):
-    # Route cho Gemini / CloudCode
     if "headroom" in ENABLED_PROXIES or "all" in ENABLED_PROXIES:
         target = f"http://127.0.0.1:{HEADROOM_PORT}/v1internal:{path}"
         return await forward_request(target, request)

@@ -32,16 +32,17 @@ def start_headroom_sub():
     env["HEADROOM_PORT"] = str(HEADROOM_PORT)
     env["HEADROOM_STATELESS"] = "true"
     env["HEADROOM_TELEMETRY"] = "off"
+    env["HEADROOM_SMART_ROUTING"] = "false"
+    env["HEADROOM_CODE_AWARE_ENABLED"] = "false"
     env["PYTHONUNBUFFERED"] = "1"
     env["MALLOC_TRIM_THRESHOLD_"] = "100000"
 
-    headroom_bin = shutil.which("headroom") or "headroom"
     cmd = [
-        headroom_bin, "proxy",
+        sys.executable, "-m", "headroom.proxy.server",
         "--host", "127.0.0.1",
         "--port", str(HEADROOM_PORT),
-        "--stateless",
-        "--no-telemetry",
+        "--no-smart-routing",
+        "--no-code-aware",
         "--no-cache"
     ]
     print(f"[Proxy Hub] Spawning Headroom: {' '.join(cmd)}", flush=True)

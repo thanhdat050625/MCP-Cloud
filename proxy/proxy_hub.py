@@ -36,10 +36,10 @@ def start_headroom_sub():
     env = os.environ.copy()
     env["HEADROOM_HOST"] = "127.0.0.1"
     env["HEADROOM_PORT"] = str(HEADROOM_PORT)
-    env["HEADROOM_STATELESS"] = "true"
-    env["HEADROOM_TELEMETRY"] = "off"
-    env["HEADROOM_SMART_ROUTING"] = "false"
-    env["HEADROOM_CODE_AWARE_ENABLED"] = "false"
+    env["HEADROOM_STATELESS"] = os.environ.get("HEADROOM_STATELESS", "false")
+    env["HEADROOM_TELEMETRY"] = os.environ.get("HEADROOM_TELEMETRY", "off")
+    env["HEADROOM_SMART_ROUTING"] = os.environ.get("HEADROOM_SMART_ROUTING", "false")
+    env["HEADROOM_CODE_AWARE_ENABLED"] = os.environ.get("HEADROOM_CODE_AWARE_ENABLED", "false")
     env["PYTHONUNBUFFERED"] = "1"
     env["MALLOC_TRIM_THRESHOLD_"] = "100000"
 

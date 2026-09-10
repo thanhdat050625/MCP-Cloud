@@ -100,26 +100,36 @@ async def memory_watchdog():
 async def background_headroom_launcher():
     global headroom_ready
     start_headroom_sub()
-    for _ in range(30):
-        await asyncio.sleep(0.5)
+    while True:
+        await asyncio.sleep(1)
+        if "headroom" not in managed_processes:
+            break
+        proc = managed_processes.get("headroom")
+        if proc and proc.poll() is not None:
+            print(f"[Proxy Hub] Headroom exited with code {proc.poll()}, restarting...", flush=True)
+            await asyncio.sleep(2)
+            start_headroom_sub()
+            continue
+
         try:
-            r = await http_client.get(f"http://127.0.0.1:{HEADROOM_PORT}/livez", timeout=1.0)
+            r = await http_client.get(f"http://127.0.0.1:{HEADROOM_PORT}/livez", timeout=1.5)
             if r.status_code == 200:
-                headroom_ready = True
-                print(f"[Proxy Hub] Headroom Proxy is READY and accepting traffic on 127.0.0.1:{HEADROOM_PORT}!", flush=True)
-                break
+                if not headroom_ready:
+                    headroom_ready = True
+                    print(f"[Proxy Hub] Headroom Proxy is READY and accepting traffic on 127.0.0.1:{HEADROOM_PORT}!", flush=True)
         except Exception:
             pass
 
-# 4. Lifespan quản lý vòng đời ứng dụng (Khởi động tức thì trong 0.05s)
+# 4. Lifespan quản lý vòng đời ứng dụng
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
     http_client = httpx.AsyncClient(timeout=None)
 
     # Khởi động Headroom bất đồng bộ trong background để port 10000 bind ngay lập tức
+    launcher_task = None
     if "headroom" in ENABLED_PROXIES or "all" in ENABLED_PROXIES:
-        asyncio.create_task(background_headroom_launcher())
+        launcher_task = asyncio.create_task(background_headroom_launcher())
 
     # Kích hoạt background watchdog
     watchdog_task = asyncio.create_task(memory_watchdog())
@@ -127,6 +137,8 @@ async def lifespan(app: FastAPI):
     yield
 
     # Dọn dẹp khi tắt server
+    if launcher_task:
+        launcher_task.cancel()
     watchdog_task.cancel()
     for name in list(managed_processes.keys()):
         stop_process(name)
@@ -177,6 +189,7 @@ async def root():
         "status": "OK",
         "service": "Proxy Gateway Hub",
         "enabled_proxies": ENABLED_PROXIES,
+        "headroom_ready": headroom_ready,
         "description": "Multi-tenant Stateless HTTP LLM Compression & Proxy Gateway"
     }
 

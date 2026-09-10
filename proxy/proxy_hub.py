@@ -153,10 +153,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Proxy Gateway Hub", lifespan=lifespan)
 
-# 5. Endpoint Health Check
-@app.get("/health")
-@app.get("/livez")
-async def health_check():
+# 5. Endpoint Health Check & Headroom Native Passthrough
+@app.get("/hub/health")
+async def hub_health():
     total_rss = 0
     hub_rss = 0
     children_rss = {}
@@ -190,15 +189,23 @@ async def health_check():
         "processes": {k: ("running" if v.poll() is None else "stopped") for k, v in managed_processes.items()}
     }
 
+@app.get("/livez")
+@app.get("/readyz")
+@app.get("/health")
+async def health_proxy(request: Request):
+    if request.query_params.get("hub"):
+        return await hub_health()
+    if ("headroom" in ENABLED_PROXIES or "all" in ENABLED_PROXIES) and headroom_ready:
+        target = f"http://127.0.0.1:{HEADROOM_PORT}{request.url.path}"
+        return await forward_request(target, request)
+    return await hub_health()
+
 @app.get("/")
-async def root():
-    return {
-        "status": "OK",
-        "service": "Proxy Gateway Hub",
-        "enabled_proxies": ENABLED_PROXIES,
-        "headroom_ready": headroom_ready,
-        "description": "Multi-tenant Stateless HTTP LLM Compression & Proxy Gateway"
-    }
+async def root(request: Request):
+    if ("headroom" in ENABLED_PROXIES or "all" in ENABLED_PROXIES) and headroom_ready:
+        target = f"http://127.0.0.1:{HEADROOM_PORT}/"
+        return await forward_request(target, request)
+    return await hub_health()
 
 # 6. Streaming Reverse Proxy Handler
 HOP_BY_HOP_HEADERS = {

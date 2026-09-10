@@ -1,7 +1,8 @@
 import express from 'express';
 import cors from 'cors';
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
 import crypto from 'crypto';
+import fs from 'fs';
 
 const app = express();
 
@@ -81,13 +82,86 @@ setInterval(() => {
   }
 }, 60000);
 
-// 3. Endpoint health check (UptimeRobot ping chống sleep)
+function getProcessRssBytes(pid) {
+  if (!pid) return 0;
+  if (process.platform === 'linux') {
+    try {
+      const status = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
+      const match = status.match(/VmRSS:\s+(\d+)\s+kB/i);
+      if (match) {
+        return parseInt(match[1], 10) * 1024;
+      }
+    } catch (e) {
+      return 0;
+    }
+  } else if (process.platform === 'win32') {
+    try {
+      const out = execSync(`powershell -NoProfile -Command (Get-Process -Id ${pid} -ErrorAction SilentlyContinue).WorkingSet64`, { timeout: 1000 }).toString().trim();
+      const bytes = parseInt(out, 10);
+      return isNaN(bytes) ? 0 : bytes;
+    } catch (e) {
+      return 0;
+    }
+  }
+  return 0;
+}
+
+// 3. Endpoint health check & Memory Telemetry (UptimeRobot ping chống sleep)
 app.get('/health', (req, res) => {
+  const parentRssBytes = process.memoryUsage().rss;
+  const parentRssMb = Math.round((parentRssBytes / (1024 * 1024)) * 100) / 100;
+
+  let totalChildrenBytes = 0;
+  const mcpsSummaryMb = {};
+  const mcpsDetail = {};
+  const sessionsDetail = [];
+
+  for (const mcp of enabledList) {
+    if (mcp !== 'all') {
+      mcpsSummaryMb[mcp] = 0;
+      mcpsDetail[mcp] = { sessions: 0, rss_mb: 0 };
+    }
+  }
+
+  for (const [id, session] of activeSessions.entries()) {
+    const tool = session.toolName || session.routePath.replace(/^\/mcp\//, '').trim();
+    const pid = session.child ? session.child.pid : null;
+    const rssBytes = pid ? getProcessRssBytes(pid) : 0;
+    const rssMb = Math.round((rssBytes / (1024 * 1024)) * 100) / 100;
+    totalChildrenBytes += rssBytes;
+
+    if (!mcpsDetail[tool]) {
+      mcpsDetail[tool] = { sessions: 0, rss_mb: 0 };
+    }
+    mcpsDetail[tool].sessions += 1;
+    mcpsDetail[tool].rss_mb = Math.round((mcpsDetail[tool].rss_mb + rssMb) * 100) / 100;
+    mcpsSummaryMb[tool] = mcpsDetail[tool].rss_mb;
+
+    sessionsDetail.push({
+      session_id: id,
+      tool,
+      pid,
+      rss_mb: rssMb,
+      uptime_seconds: Math.round((Date.now() - (session.startTime || session.lastActivity)) / 1000)
+    });
+  }
+
+  const childrenRssMb = Math.round((totalChildrenBytes / (1024 * 1024)) * 100) / 100;
+  const totalRssMb = Math.round((parentRssMb + childrenRssMb) * 100) / 100;
+
   res.status(200).json({
     status: "OK",
     timestamp: new Date().toISOString(),
     enabled_mcps: enabledList,
-    active_sessions: activeSessions.size
+    active_sessions: activeSessions.size,
+    memory: {
+      parent_rss_mb: parentRssMb,
+      mcps_rss_mb: mcpsSummaryMb,
+      children_rss_mb: childrenRssMb,
+      total_rss_mb: totalRssMb,
+      mcps_detail: mcpsDetail
+    },
+    sessions: sessionsDetail
   });
 });
 
@@ -134,9 +208,14 @@ function createMcpChildSession(sessionId, routePath, commandResolver, req, isLeg
     env: { ...process.env, ...config.env }
   });
 
+  const toolName = routePath.replace(/^\/mcp\//, '').trim();
+
   const session = {
     id: sessionId,
+    routePath,
+    toolName,
     child,
+    startTime: Date.now(),
     pendingRequests: new Map(),
     sseRes: null,
     lastActivity: Date.now(),

@@ -16,10 +16,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-# Cài đặt các gói cần thiết và gỡ bỏ các thư viện ML nặng (torch, transformers, onnxruntime)
-# để RAM giữ ở mức ~80MB, tránh vượt ngưỡng 512MB của Render Free
+# Giữ onnxruntime siêu nhẹ (~30MB) và gỡ bỏ PyTorch (torch) khổng lồ (~800MB)
+# để Headroom chạy ổn định ở mức ~150MB RAM trên Render Free
 RUN pip install --no-cache-dir -r requirements.txt \
-    && pip uninstall -y torch transformers onnxruntime safetensors || true
+    && pip uninstall -y torch || true
 
 COPY . .
 

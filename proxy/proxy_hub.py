@@ -41,7 +41,7 @@ def start_headroom_sub():
         sys.executable, "-m", "headroom.proxy.server",
         "--host", "127.0.0.1",
         "--port", str(HEADROOM_PORT),
-        "--no-smart-routing",
+        "--disable-kompress",
         "--no-code-aware",
         "--no-cache"
     ]

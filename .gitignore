@@ -4,11 +4,14 @@ node_modules/
 */*/node_modules/
 package-lock.json
 
-# Environment variables & secrets
+# Environment variables & secrets (All levels)
 .env
-.env.local
-.env.*.local
+.env.*
 *.env
+**/.env
+**/.env.*
+!*.env.example
+!**/.env.example
 
 # Logs
 logs/
@@ -37,14 +40,18 @@ dist/
 tmp/
 temp/
 scratch/
+build/
+*.egg-info/
 
 # Python & Virtualenv
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*/**/__pycache__/
+*.py[cod]
+*$py.class
 .venv/
+*/.venv/
 venv/
+*/venv/
 ENV/
 .headroom/
-
+**/.headroom/

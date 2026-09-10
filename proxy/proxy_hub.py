@@ -12,6 +12,12 @@ import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # 1. Biến môi trường & cấu hình
 PORT = int(os.environ.get("PORT", "10000"))
 raw_enabled = os.environ.get("ENABLED_PROXIES", "headroom")

@@ -37,3 +37,14 @@ dist/
 tmp/
 temp/
 scratch/
+
+# Python & Virtualenv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+ENV/
+.headroom/
+
